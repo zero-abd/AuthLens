@@ -43,6 +43,7 @@ DB_DIR = Path("db")
 DB_DIR.mkdir(exist_ok=True)
 
 LEDGER_FILE = DB_DIR / "ledger.json"
+REMOTE_CAMERAS_FILE = DB_DIR / "remote_cameras.json"
 
 def load_ledger():
     try:
@@ -63,6 +64,37 @@ def save_ledger_entry(entry: dict):
         print(f"✅ Ledger entry saved successfully. Total entries: {len(ledger)}")
     except Exception as e:
         print(f"❌ Error saving ledger entry: {e}")
+
+def load_remote_cameras():
+    """Load remote cameras from JSON file"""
+    try:
+        if REMOTE_CAMERAS_FILE.exists():
+            with open(REMOTE_CAMERAS_FILE, "r") as f:
+                cameras_data = json.load(f)
+                print(f"✅ Loaded {len(cameras_data)} remote cameras from storage")
+                return cameras_data
+        return {}
+    except Exception as e:
+        print(f"❌ Error loading remote cameras: {e}")
+        return {}
+
+def save_remote_cameras(cameras_dict: Dict):
+    try:
+        cameras_to_save = {}
+        for camera_id, camera_data in cameras_dict.items():
+            cameras_to_save[camera_id] = {
+                "camera_id": camera_data["camera_id"],
+                "camera_name": camera_data["camera_name"],
+                "ngrok_url": camera_data["ngrok_url"],
+                "created_at": camera_data["created_at"],
+                "chunks_recorded": camera_data.get("chunks_recorded", 0)
+            }
+        
+        with open(REMOTE_CAMERAS_FILE, "w") as f:
+            json.dump(cameras_to_save, f, indent=2)
+        print(f"✅ Saved {len(cameras_to_save)} remote cameras to storage")
+    except Exception as e:
+        print(f"❌ Error saving remote cameras: {e}")
 
 try:
     w3 = Web3(Web3.HTTPProvider(SEPOLIA_RPC_URL))
@@ -121,6 +153,21 @@ class RemoteCameraResponse(BaseModel):
 remote_cameras: Dict[str, Dict] = {}
 # Background tasks for streaming
 streaming_tasks: Dict[str, asyncio.Task] = {}
+
+# Load remote cameras from storage on startup
+def initialize_remote_cameras():
+    """Load remote cameras from persistent storage on startup"""
+    global remote_cameras
+    loaded_cameras = load_remote_cameras()
+    for camera_id, camera_data in loaded_cameras.items():
+        # Add runtime state fields
+        camera_data["status"] = "stopped"
+        camera_data["is_monitoring"] = False
+        remote_cameras[camera_id] = camera_data
+    print(f"📹 Initialized {len(remote_cameras)} remote cameras")
+
+# Initialize cameras on startup
+initialize_remote_cameras()
 
 
 def hash_video_bytes(video_data: bytes) -> bytes:
@@ -883,6 +930,9 @@ async def add_remote_camera(config: RemoteCameraConfig):
         }
         remote_cameras[camera_id] = camera_data
         
+        # Save to persistent storage
+        save_remote_cameras(remote_cameras)
+        
         return {"success": True, "message": "Remote camera added successfully", "camera": camera_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding remote camera: {str(e)}")
@@ -911,6 +961,9 @@ async def remove_remote_camera(camera_id: str):
         camera_data = remote_cameras[camera_id]
         del remote_cameras[camera_id]
         
+        # Save to persistent storage (removing the camera)
+        save_remote_cameras(remote_cameras)
+        
         return {"success": True, "message": f"Camera {camera_data['camera_name']} removed successfully"}
     except HTTPException:
         raise
@@ -931,7 +984,7 @@ async def start_remote_camera_monitoring(camera_id: str):
         camera = remote_cameras[camera_id]
         camera["status"] = "active"
         camera["is_monitoring"] = True
-        camera["chunks_recorded"] = 0
+        # Don't reset chunks_recorded - keep the count across starts/stops
         
         # Start the streaming and recording task
         task = asyncio.create_task(stream_and_record_remote_camera(
@@ -1172,6 +1225,10 @@ async def stream_and_record_remote_camera(camera_id: str, ngrok_url: str, camera
                     
                     remote_cameras[camera_id]["chunks_recorded"] += 1
                     remote_cameras[camera_id]["last_chunk"] = datetime.now().isoformat()
+                    
+                    # Save updated chunks count to persistent storage
+                    save_remote_cameras(remote_cameras)
+                    
                     print(f"✅ Chunk saved: {filename} ({len(chunk_data)} bytes, {frame_count} frames)")
                 else:
                     print(f"⚠️ No data received for {camera_id} ({camera_name}) in this minute")
