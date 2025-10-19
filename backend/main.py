@@ -103,12 +103,20 @@ def store_hash_on_chain(video_hash_bytes: bytes) -> dict:
         raise HTTPException(status_code=503, detail="Blockchain connection not available")
     
     try:
+        hash_hex = f"0x{video_hash_bytes.hex()}"
+        print(f"\n{'='*60}")
+        print(f"📝 STORING HASH ON BLOCKCHAIN")
+        print(f"{'='*60}")
+        print(f"Hash: {hash_hex}")
+        
         exists, _ = contract.functions.verifyHash(video_hash_bytes).call()
         if exists:
+            print(f"ℹ️  Hash already exists on blockchain")
+            print(f"{'='*60}\n")
             return {
                 "success": True,
                 "message": "Hash already exists on blockchain",
-                "hash": f"0x{video_hash_bytes.hex()}",
+                "hash": hash_hex,
                 "already_exists": True
             }
 
@@ -122,17 +130,31 @@ def store_hash_on_chain(video_hash_bytes: bytes) -> dict:
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         
+        print(f"⏳ Transaction submitted: {tx_hash.hex()}")
+        
         tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        print(f"✅ Hash stored successfully!")
+        print(f"Transaction hash: {tx_receipt.transactionHash.hex()}")
+        print(f"Block number: {tx_receipt.blockNumber}")
+        print(f"Gas used: {tx_receipt.gasUsed}")
+        print(f"{'='*60}\n")
         
         return {
             "success": True,
             "message": "Hash stored successfully",
-            "hash": f"0x{video_hash_bytes.hex()}",
+            "hash": hash_hex,
             "transaction_hash": tx_receipt.transactionHash.hex(),
             "already_exists": False
         }
 
     except Exception as e:
+        print(f"\n{'='*60}")
+        print(f"❌ ERROR STORING HASH ON BLOCKCHAIN")
+        print(f"{'='*60}")
+        print(f"Hash: 0x{video_hash_bytes.hex()}")
+        print(f"Error: {str(e)}")
+        print(f"{'='*60}\n")
         raise HTTPException(status_code=500, detail=f"Blockchain error: {str(e)}")
 
 
@@ -141,15 +163,34 @@ def verify_hash_on_chain(video_hash_bytes: bytes) -> dict:
         raise HTTPException(status_code=503, detail="Blockchain connection not available")
     
     try:
+        hash_hex = f"0x{video_hash_bytes.hex()}"
+        print(f"\n{'='*60}")
+        print(f"🔍 VERIFYING HASH ON BLOCKCHAIN")
+        print(f"{'='*60}")
+        print(f"Hash: {hash_hex}")
+        
         exists, uploader_address = contract.functions.verifyHash(video_hash_bytes).call()
+        
+        if exists:
+            print(f"✅ Video is authentic!")
+            print(f"Uploader: {uploader_address}")
+        else:
+            print(f"❌ Video not found on blockchain")
+        print(f"{'='*60}\n")
         
         return {
             "verified": exists,
-            "hash": f"0x{video_hash_bytes.hex()}",
+            "hash": hash_hex,
             "uploader": uploader_address if exists else None,
             "message": "Video is authentic" if exists else "Video not found on blockchain"
         }
     except Exception as e:
+        print(f"\n{'='*60}")
+        print(f"❌ ERROR VERIFYING HASH")
+        print(f"{'='*60}")
+        print(f"Hash: 0x{video_hash_bytes.hex()}")
+        print(f"Error: {str(e)}")
+        print(f"{'='*60}\n")
         raise HTTPException(status_code=500, detail=f"Blockchain error: {str(e)}")
 
 
