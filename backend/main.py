@@ -41,6 +41,20 @@ VIDEO_STORAGE_DIR.mkdir(exist_ok=True)
 DB_DIR = Path("db")
 DB_DIR.mkdir(exist_ok=True)
 
+LEDGER_FILE = DB_DIR / "ledger.json"
+
+def load_ledger():
+    if LEDGER_FILE.exists():
+        with open(LEDGER_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_ledger_entry(entry: dict):
+    ledger = load_ledger()
+    ledger.append(entry)
+    with open(LEDGER_FILE, "w") as f:
+        json.dump(ledger, f, indent=2)
+
 try:
     w3 = Web3(Web3.HTTPProvider(SEPOLIA_RPC_URL))
     if not w3.is_connected():
@@ -147,6 +161,7 @@ def store_hash_on_chain(video_hash_bytes: bytes) -> dict:
             "message": "Hash stored successfully",
             "hash": hash_hex,
             "transaction_hash": tx_receipt.transactionHash.hex(),
+            "block_number": tx_receipt.blockNumber,
             "already_exists": False
         }
 
@@ -458,6 +473,11 @@ def process_video_hash_in_background(filepath: Path, video_data: bytes):
     try:
         print(f"\n🔄 Background processing started for: {filepath.name}")
         
+        # Extract camera_id and time from filename
+        filename = filepath.stem
+        parts = filename.split("_", 1)
+        camera_id = parts[0] if len(parts) > 0 else "unknown"
+        
         # Calculate hash
         video_hash = hash_video_bytes(video_data)
         hash_hex = f"0x{video_hash.hex()}"
@@ -466,6 +486,18 @@ def process_video_hash_in_background(filepath: Path, video_data: bytes):
         
         # Store on blockchain
         blockchain_result = store_hash_on_chain(video_hash)
+        
+        # Save to ledger
+        ledger_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "camera_id": camera_id,
+            "chunk_filename": filepath.name,
+            "video_hash": hash_hex,
+            "transaction_hash": blockchain_result.get("transaction_hash", "already_exists"),
+            "block_number": blockchain_result.get("block_number"),
+            "status": "stored" if blockchain_result["success"] else "failed"
+        }
+        save_ledger_entry(ledger_entry)
         
         print(f"✅ Background processing completed for: {filepath.name}")
         print(f"   Blockchain result: {blockchain_result['message']}")
@@ -525,6 +557,37 @@ async def list_monitoring_chunks(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing chunks: {str(e)}")
+
+
+@app.get("/api/ledger")
+async def get_ledger(
+    limit: Optional[int] = Query(100, description="Maximum number of entries to return"),
+    camera_id: Optional[str] = Query(None, description="Filter by camera ID")
+):
+    """
+    Get ledger entries of all chunks stored on blockchain
+    """
+    try:
+        ledger = load_ledger()
+        
+        # Filter by camera_id if provided
+        if camera_id:
+            ledger = [entry for entry in ledger if entry.get("camera_id") == camera_id]
+        
+        # Sort by timestamp (newest first)
+        ledger = sorted(ledger, key=lambda x: x.get("timestamp", ""), reverse=True)
+        
+        # Limit results
+        ledger = ledger[:limit]
+        
+        return {
+            "success": True,
+            "total_entries": len(ledger),
+            "entries": ledger
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching ledger: {str(e)}")
 
 
 def split_video_into_minute_chunks(video_path: Path) -> List[tuple[Path, int, int]]:
