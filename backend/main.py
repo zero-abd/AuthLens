@@ -44,16 +44,24 @@ DB_DIR.mkdir(exist_ok=True)
 LEDGER_FILE = DB_DIR / "ledger.json"
 
 def load_ledger():
-    if LEDGER_FILE.exists():
-        with open(LEDGER_FILE, "r") as f:
-            return json.load(f)
-    return []
+    try:
+        if LEDGER_FILE.exists():
+            with open(LEDGER_FILE, "r") as f:
+                return json.load(f)
+        return []
+    except Exception as e:
+        print(f"❌ Error loading ledger: {e}")
+        return []
 
 def save_ledger_entry(entry: dict):
-    ledger = load_ledger()
-    ledger.append(entry)
-    with open(LEDGER_FILE, "w") as f:
-        json.dump(ledger, f, indent=2)
+    try:
+        ledger = load_ledger()
+        ledger.append(entry)
+        with open(LEDGER_FILE, "w") as f:
+            json.dump(ledger, f, indent=2)
+        print(f"✅ Ledger entry saved successfully. Total entries: {len(ledger)}")
+    except Exception as e:
+        print(f"❌ Error saving ledger entry: {e}")
 
 try:
     w3 = Web3(Web3.HTTPProvider(SEPOLIA_RPC_URL))
@@ -568,11 +576,14 @@ async def get_ledger(
     Get ledger entries of all chunks stored on blockchain
     """
     try:
+        print(f"📖 Fetching ledger entries (limit={limit}, camera_id={camera_id})")
         ledger = load_ledger()
+        print(f"📊 Loaded {len(ledger)} total entries from ledger")
         
         # Filter by camera_id if provided
         if camera_id:
             ledger = [entry for entry in ledger if entry.get("camera_id") == camera_id]
+            print(f"🔍 Filtered to {len(ledger)} entries for camera_id={camera_id}")
         
         # Sort by timestamp (newest first)
         ledger = sorted(ledger, key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -587,6 +598,7 @@ async def get_ledger(
         }
         
     except Exception as e:
+        print(f"❌ Error fetching ledger: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching ledger: {str(e)}")
 
 
