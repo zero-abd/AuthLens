@@ -1,6 +1,6 @@
 # AuthLens: Where Evidence Meets Certainty
 
-<p align="center"><i>Built for HackTX 2025</i></p>
+<p align="left"><i>Built for HackTX 2025</i></p>
 
 ## 📖 Overview
 
