@@ -1127,9 +1127,12 @@ async def stream_and_record_remote_camera(camera_id: str, ngrok_url: str, camera
         print(f"⏱️ Waiting {initial_wait:.1f}s until {next_minute.strftime('%H:%M:%S')} to start synchronized recording for {camera_id} ({camera_name})")
         await asyncio.sleep(initial_wait)
         
+        # Initialize chunk timing aligned to minute boundaries
+        chunk_start_time = next_minute
+        
         while camera_id in remote_cameras and remote_cameras[camera_id].get("is_monitoring", False):
             try:
-                start_time = datetime.now().replace(second=0, microsecond=0)
+                start_time = chunk_start_time
                 end_time = start_time + timedelta(minutes=1)
                 print(f"📹 Recording chunk for {camera_id} ({camera_name}): {start_time.strftime('%H:%M:%S')} to {end_time.strftime('%H:%M:%S')}")
                 
@@ -1137,8 +1140,16 @@ async def stream_and_record_remote_camera(camera_id: str, ngrok_url: str, camera
                 async with buffer_lock:
                     frame_buffer.clear()
                 
-                # Wait for 60 seconds to accumulate frames
-                await asyncio.sleep(60)
+                # Calculate precise wait time until the end of this minute
+                now = datetime.now()
+                remaining_time = (end_time - now).total_seconds()
+                
+                # Ensure we wait at least close to 60 seconds, but respect minute boundaries
+                if remaining_time > 0:
+                    await asyncio.sleep(remaining_time)
+                else:
+                    # If we're already past the end time (shouldn't happen), wait 60 seconds
+                    await asyncio.sleep(60)
                 
                 # Get accumulated frames
                 async with buffer_lock:
@@ -1164,12 +1175,17 @@ async def stream_and_record_remote_camera(camera_id: str, ngrok_url: str, camera
                     print(f"✅ Chunk saved: {filename} ({len(chunk_data)} bytes, {frame_count} frames)")
                 else:
                     print(f"⚠️ No data received for {camera_id} ({camera_name}) in this minute")
+                
+                # Move to the next minute boundary
+                chunk_start_time = end_time
                     
             except asyncio.CancelledError:
                 print(f"🛑 Recording loop cancelled for {camera_id} ({camera_name})")
                 break
             except Exception as e:
                 print(f"❌ Error in recording loop for {camera_id} ({camera_name}): {e}")
+                # On error, still advance to next minute to maintain sync
+                chunk_start_time = end_time
                 await asyncio.sleep(5)
     finally:
         accumulator_task.cancel()
