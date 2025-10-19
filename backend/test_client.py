@@ -19,6 +19,10 @@ def test_health():
 
 def test_upload_chunk(video_path: str, start_time: datetime, end_time: datetime):
     """Test uploading a video chunk"""
+    # Truncate to seconds for cleaner output
+    start_time = start_time.replace(microsecond=0)
+    end_time = end_time.replace(microsecond=0)
+    
     print(f"📤 Uploading video chunk: {video_path}")
     print(f"   Time range: {start_time.isoformat()} to {end_time.isoformat()}")
     
@@ -75,6 +79,12 @@ def test_list_chunks(start_time=None, end_time=None):
     """Test listing video chunks"""
     print("📋 Listing video chunks...")
     
+    # Truncate to seconds for cleaner output
+    if start_time:
+        start_time = start_time.replace(microsecond=0)
+    if end_time:
+        end_time = end_time.replace(microsecond=0)
+    
     params = {}
     if start_time:
         params["start_datetime"] = start_time.isoformat()
@@ -99,6 +109,10 @@ def test_list_chunks(start_time=None, end_time=None):
 
 def test_retrieve_video(start_time: datetime, end_time: datetime, output_path: str):
     """Test retrieving a video range"""
+    # Truncate to seconds for cleaner output
+    start_time = start_time.replace(microsecond=0)
+    end_time = end_time.replace(microsecond=0)
+    
     print(f"📥 Retrieving video from {start_time.isoformat()} to {end_time.isoformat()}")
     
     params = {

@@ -49,14 +49,15 @@ try:
         print(f"✅ Connected to Ethereum. Using wallet: {account.address}")
 
         # Load the contract ABI
-        abi_path = Path("VideoAuth.json")
+        abi_path = Path(__file__).parent / "VideoAuth.json"
         if abi_path.exists():
             with open(abi_path) as f:
                 contract_json = json.load(f)
                 contract_abi = contract_json["abi"]
             contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=contract_abi)
+            print(f"✅ Contract loaded at address: {CONTRACT_ADDRESS}")
         else:
-            print("⚠️ Warning: VideoAuth.json not found. Contract interaction disabled.")
+            print(f"⚠️ Warning: VideoAuth.json not found at {abi_path}. Contract interaction disabled.")
             contract = None
 except Exception as e:
     print(f"❌ Error during setup: {e}")
@@ -128,7 +129,7 @@ def store_hash_on_chain(video_hash_bytes: bytes) -> dict:
 
         # Sign and send the transaction
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         
         # Wait for confirmation
         tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
@@ -216,9 +217,9 @@ async def process_video_chunk(
     3. Store the hash on blockchain
     """
     try:
-        # Parse timestamps
-        start_dt = datetime.fromisoformat(start_time)
-        end_dt = datetime.fromisoformat(end_time)
+        # Parse timestamps and truncate to seconds (remove microseconds)
+        start_dt = datetime.fromisoformat(start_time).replace(microsecond=0)
+        end_dt = datetime.fromisoformat(end_time).replace(microsecond=0)
         
         # Create filename based on timestamps
         start_str = format_timestamp_for_filename(start_dt)
@@ -310,9 +311,9 @@ async def retrieve_video_range(
     Returns the combined video file.
     """
     try:
-        # Parse timestamps
-        start_dt = datetime.fromisoformat(start_datetime)
-        end_dt = datetime.fromisoformat(end_datetime)
+        # Parse timestamps and truncate to seconds (remove microseconds)
+        start_dt = datetime.fromisoformat(start_datetime).replace(microsecond=0)
+        end_dt = datetime.fromisoformat(end_datetime).replace(microsecond=0)
         
         # Get video chunks in range
         chunks = get_video_chunks_in_range(start_dt, end_dt)
@@ -378,14 +379,14 @@ async def list_video_chunks(
                 chunk_start = datetime.strptime(parts[0], "%Y-%m-%d_%H-%M-%S")
                 chunk_end = datetime.strptime(parts[1], "%Y-%m-%d_%H-%M-%S")
                 
-                # Apply filters if provided
+                # Apply filters if provided (truncate to seconds)
                 if start_datetime:
-                    filter_start = datetime.fromisoformat(start_datetime)
+                    filter_start = datetime.fromisoformat(start_datetime).replace(microsecond=0)
                     if chunk_end < filter_start:
                         continue
                 
                 if end_datetime:
-                    filter_end = datetime.fromisoformat(end_datetime)
+                    filter_end = datetime.fromisoformat(end_datetime).replace(microsecond=0)
                     if chunk_start > filter_end:
                         continue
                 
