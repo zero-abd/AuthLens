@@ -6,14 +6,16 @@ from typing import Optional, List
 from pathlib import Path
 import shutil
 import tempfile
+import subprocess
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Body, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from web3 import Web3
 import io
+import ffmpeg
 
 load_dotenv()
 
@@ -400,60 +402,48 @@ async def list_video_chunks(
 
 @app.post("/api/monitor/upload-chunk")
 async def upload_monitoring_chunk(
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     camera_id: str = Query(..., description="Camera identifier (e.g., cam_1)"),
     start_time: str = Query(..., description="Start time in format YYYY-MM-DD_HH-MM-00"),
     end_time: str = Query(..., description="End time in format YYYY-MM-DD_HH-MM-00")
 ):
-    """
-    Upload a 1-minute video chunk from monitoring camera.
-    Stores in db/ folder with naming: cam_1_start-date_time-end_date_time.mp4
-    """
     try:
-        # Validate camera_id
         if not camera_id or not camera_id.startswith("cam_"):
             raise HTTPException(status_code=400, detail="Invalid camera_id format. Use cam_N")
         
-        # Parse and validate timestamps
         try:
             start_dt = datetime.strptime(start_time, "%Y-%m-%d_%H-%M-%S")
             end_dt = datetime.strptime(end_time, "%Y-%m-%d_%H-%M-%S")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid time format. Use YYYY-MM-DD_HH-MM-SS")
         
-        # Ensure times end at 00 seconds
         if start_dt.second != 0 or end_dt.second != 0:
             raise HTTPException(status_code=400, detail="Times must end at 00 seconds")
         
-        # Validate it's approximately 1 minute
         duration = (end_dt - start_dt).total_seconds()
         if duration < 50 or duration > 70:
             raise HTTPException(status_code=400, detail="Chunk duration must be approximately 60 seconds")
         
-        # Create filename
         filename = f"{camera_id}_{start_time}-{end_time}.mp4"
         filepath = DB_DIR / filename
         
-        # Save video chunk
         video_data = await video.read()
         with open(filepath, "wb") as f:
             f.write(video_data)
         
-        # Calculate hash and store on blockchain
-        video_hash = hash_video_bytes(video_data)
-        blockchain_result = store_hash_on_chain(video_hash)
+        background_tasks.add_task(process_video_hash_in_background, filepath, video_data)
         
         return {
             "success": True,
-            "message": "Video chunk uploaded and stored successfully",
+            "message": "Video chunk uploaded successfully. Hash processing in background.",
             "filename": filename,
             "camera_id": camera_id,
             "start_time": start_time,
             "end_time": end_time,
             "file_size_bytes": len(video_data),
-            "video_hash": f"0x{video_hash.hex()}",
-            "blockchain": blockchain_result,
-            "stored_in": str(filepath)
+            "stored_in": str(filepath),
+            "note": "Hash generation and blockchain storage will complete in background"
         }
         
     except HTTPException:
@@ -464,26 +454,85 @@ async def upload_monitoring_chunk(
         raise HTTPException(status_code=500, detail=f"Error processing video chunk: {str(e)}")
 
 
+def process_video_hash_in_background(filepath: Path, video_data: bytes):
+    try:
+        print(f"\n🔄 Background processing started for: {filepath.name}")
+        
+        # Calculate hash
+        video_hash = hash_video_bytes(video_data)
+        hash_hex = f"0x{video_hash.hex()}"
+        
+        print(f"📊 Hash calculated: {hash_hex}")
+        
+        # Store on blockchain
+        blockchain_result = store_hash_on_chain(video_hash)
+        
+        print(f"✅ Background processing completed for: {filepath.name}")
+        print(f"   Blockchain result: {blockchain_result['message']}")
+        
+    except Exception as e:
+        print(f"❌ Error in background processing for {filepath.name}: {e}")
+
+
+@app.get("/api/monitor/list-chunks")
+async def list_monitoring_chunks(
+    camera_id: Optional[str] = Query(None, description="Filter by camera ID")
+):
+    try:
+        chunks = []
+        
+        for video_file in sorted(DB_DIR.glob("*.mp4")):
+            try:
+                filename = video_file.stem
+                
+                if not filename.startswith("cam_"):
+                    continue
+                
+                if camera_id and not filename.startswith(f"{camera_id}_"):
+                    continue
+                
+                parts = filename.split("_", 1)
+                if len(parts) != 2:
+                    continue
+                
+                cam_id = parts[0]
+                time_parts = parts[1].split("-", 6)
+                
+                video_data = video_file.read_bytes()
+                video_hash = hash_video_bytes(video_data)
+                
+                try:
+                    verification = verify_hash_on_chain(video_hash)
+                    blockchain_status = "verified" if verification["verified"] else "not_verified"
+                except:
+                    blockchain_status = "unknown"
+                
+                chunks.append({
+                    "filename": video_file.name,
+                    "camera_id": cam_id,
+                    "size_bytes": video_file.stat().st_size,
+                    "video_hash": f"0x{video_hash.hex()}",
+                    "blockchain_status": blockchain_status
+                })
+            except Exception as e:
+                print(f"Error processing {video_file}: {e}")
+                continue
+        
+        return {
+            "chunks": chunks,
+            "total_chunks": len(chunks)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing chunks: {str(e)}")
+
+
 def split_video_into_minute_chunks(video_path: Path) -> List[tuple[Path, int, int]]:
-    """
-    Split a video file into 1-minute chunks.
-    Returns list of (chunk_path, start_second, end_second)
-    
-    NOTE: This is a simplified version. In production, use ffmpeg for proper video splitting.
-    For now, we'll treat each minute as a separate logical chunk without actual splitting.
-    """
-    # Get video file size to estimate duration (rough estimate)
     file_size = video_path.stat().st_size
-    
-    # Rough estimate: ~1MB per second of video at medium quality
-    # This is very approximate and should be replaced with actual video analysis
-    estimated_duration_seconds = file_size / (1024 * 1024)  # Very rough
+    estimated_duration_seconds = file_size / (1024 * 1024)
     
     chunks = []
-    chunk_duration = 60  # 1 minute
-    
-    # For now, we'll use a simple approach: read the entire file and logically divide it
-    # In production, use ffmpeg or similar to actually split the video
+    chunk_duration = 60
     num_chunks = max(1, int(estimated_duration_seconds / chunk_duration))
     
     temp_dir = Path(tempfile.mkdtemp())
@@ -492,14 +541,146 @@ def split_video_into_minute_chunks(video_path: Path) -> List[tuple[Path, int, in
         start_sec = i * chunk_duration
         end_sec = (i + 1) * chunk_duration
         
-        # For now, we create a reference to the original file
-        # In production, actually split using ffmpeg
         chunk_path = temp_dir / f"chunk_{i}.mp4"
-        shutil.copy(video_path, chunk_path)  # Simplified - copies whole file
+        shutil.copy(video_path, chunk_path)
         
         chunks.append((chunk_path, start_sec, end_sec))
     
     return chunks
+
+
+@app.get("/api/monitor/download-range")
+async def download_video_range(
+    camera_id: str = Query(..., description="Camera identifier (e.g., cam_1)"),
+    start_datetime: str = Query(..., description="Start datetime in format YYYY-MM-DDTHH:MM:SS"),
+    end_datetime: str = Query(..., description="End datetime in format YYYY-MM-DDTHH:MM:SS")
+):
+    temp_files = []
+    
+    try:
+        try:
+            start_dt = datetime.fromisoformat(start_datetime).replace(microsecond=0)
+            end_dt = datetime.fromisoformat(end_datetime).replace(microsecond=0)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid datetime format. Use ISO format: YYYY-MM-DDTHH:MM:SS")
+        
+        if end_dt <= start_dt:
+            raise HTTPException(status_code=400, detail="End time must be after start time")
+        
+        matching_chunks = []
+        
+        for video_file in sorted(DB_DIR.glob(f"{camera_id}_*.mp4")):
+            try:
+                filename = video_file.stem
+                
+                if not filename.startswith(f"{camera_id}_"):
+                    continue
+                
+                time_part = filename[len(camera_id) + 1:]
+                time_components = time_part.split("-")
+                
+                if len(time_components) >= 10:
+                    start_year = int(time_components[0])
+                    start_month = int(time_components[1])
+                    start_day_hour = time_components[2].split("_")
+                    start_day = int(start_day_hour[0])
+                    start_hour = int(start_day_hour[1])
+                    start_minute = int(time_components[3])
+                    start_second = int(time_components[4])
+                    
+                    chunk_start = datetime(start_year, start_month, start_day, start_hour, start_minute, start_second)
+                    
+                    end_year = int(time_components[5])
+                    end_month = int(time_components[6])
+                    end_day_hour = time_components[7].split("_")
+                    end_day = int(end_day_hour[0])
+                    end_hour = int(end_day_hour[1])
+                    end_minute = int(time_components[8])
+                    end_second = int(time_components[9])
+                    
+                    chunk_end = datetime(end_year, end_month, end_day, end_hour, end_minute, end_second)
+                    
+                    if chunk_start >= start_dt and chunk_start < end_dt:
+                        matching_chunks.append((chunk_start, video_file))
+                
+            except Exception as e:
+                print(f"Error parsing {video_file}: {e}")
+                continue
+        
+        if not matching_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No video chunks found for camera {camera_id} in the time range {start_datetime} to {end_datetime}"
+            )
+        
+        matching_chunks.sort(key=lambda x: x[0])
+        chunk_files = [chunk[1] for chunk in matching_chunks]
+        
+        if len(chunk_files) == 1:
+            output_filename = f"{camera_id}_{formatTimeForFilename(start_dt)}_to_{formatTimeForFilename(end_dt)}.mp4"
+            return FileResponse(
+                chunk_files[0],
+                media_type="video/mp4",
+                filename=output_filename
+            )
+        
+        try:
+            temp_dir = Path(tempfile.mkdtemp())
+            temp_files.append(temp_dir)
+            
+            concat_file = temp_dir / "concat.txt"
+            with open(concat_file, "w") as f:
+                for chunk_file in chunk_files:
+                    abs_path = chunk_file.absolute()
+                    f.write(f"file '{abs_path}'\n")
+            
+            output_filename = f"{camera_id}_{formatTimeForFilename(start_dt)}_to_{formatTimeForFilename(end_dt)}.mp4"
+            output_path = temp_dir / output_filename
+            
+            try:
+                (
+                    ffmpeg
+                    .input(str(concat_file), format='concat', safe=0)
+                    .output(str(output_path), vcodec='libx264', acodec='aac')
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+            except ffmpeg.Error as e:
+                print(f"FFmpeg error: {e.stderr.decode()}")
+                raise HTTPException(status_code=500, detail="Error merging video chunks with ffmpeg")
+            
+            return FileResponse(
+                output_path,
+                media_type="video/mp4",
+                filename=output_filename,
+                background=BackgroundTasks().add_task(cleanup_temp_files, temp_files)
+            )
+            
+        except Exception as e:
+            cleanup_temp_files(temp_files)
+            raise HTTPException(status_code=500, detail=f"Error merging videos: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        cleanup_temp_files(temp_files)
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+
+
+def formatTimeForFilename(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def cleanup_temp_files(temp_files: list):
+    for temp_file in temp_files:
+        try:
+            if isinstance(temp_file, Path):
+                if temp_file.is_dir():
+                    shutil.rmtree(temp_file, ignore_errors=True)
+                elif temp_file.exists():
+                    temp_file.unlink()
+        except Exception as e:
+            print(f"Error cleaning up {temp_file}: {e}")
 
 
 @app.post("/api/validate/upload")
@@ -527,22 +708,12 @@ async def validate_uploaded_video(
         
         # Get total file size for progress calculation
         total_size = len(video_data)
-        
-        # Split video into minute chunks (simplified)
-        # In production, use ffmpeg to actually split the video
-        # For now, we'll process the whole video as chunks
-        
-        # Estimate number of chunks (rough)
-        estimated_chunks = max(1, int(total_size / (1024 * 1024 * 10)))  # Assume ~10MB per minute
+        estimated_chunks = max(1, int(total_size / (1024 * 1024 * 10)))
         
         results = []
         validated_count = 0
         not_validated_count = 0
         
-        # For simplicity, we'll treat the video as a single chunk or multiple logical chunks
-        # Check if entire video or chunks exist in blockchain
-        
-        # Process as single chunk for now
         video_hash = hash_video_bytes(video_data)
         verification = verify_hash_on_chain(video_hash)
         
@@ -560,7 +731,6 @@ async def validate_uploaded_video(
         else:
             not_validated_count += 1
         
-        # Determine overall verdict
         if validated_count > 0 and not_validated_count == 0:
             verdict = "validated"
             message = "Video is validated - recorded on a facility camera"
@@ -585,14 +755,12 @@ async def validate_uploaded_video(
         raise HTTPException(status_code=500, detail=f"Error validating video: {str(e)}")
     
     finally:
-        # Clean up temporary files
         if temp_video_path and temp_video_path.exists():
             try:
                 temp_video_path.unlink()
             except Exception as e:
                 print(f"Error deleting temp file: {e}")
         
-        # Clean up chunk paths
         for chunk_path in chunk_paths:
             try:
                 if chunk_path.exists():
