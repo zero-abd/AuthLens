@@ -1,0 +1,39 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_24-77b8162f7900f1642b167e658693d56e4a9c4943",
+  "solcVersion": "0.8.24",
+  "solcLongVersion": "0.8.24+commit.e11b9ed9",
+  "userSourceNameMap": {
+    "contracts/VideoAuth.sol": "project/contracts/VideoAuth.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "shanghai",
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode",
+            "evm.deployedBytecode",
+            "evm.methodIdentifiers",
+            "metadata"
+          ]
+        }
+      },
+      "remappings": []
+    },
+    "sources": {
+      "project/contracts/VideoAuth.sol": {
+        "content": "// SPDX-License-Identifier: MIT\r\npragma solidity ^0.8.20;\r\n\r\ncontract VideoAuth {\r\n    mapping(bytes32 => address) public hashes;\r\n    event HashStored(address indexed uploader, bytes32 indexed videoHash);\r\n\r\n    function storeHash(bytes32 _videoHash) public {\r\n        require(hashes[_videoHash] == address(0), \"Error: This video hash has already been registered.\");\r\n        hashes[_videoHash] = msg.sender;\r\n        emit HashStored(msg.sender, _videoHash);\r\n    }\r\n\r\n    function verifyHash(bytes32 _videoHash) public view returns (bool, address) {\r\n        address uploader = hashes[_videoHash];\r\n        bool exists = (uploader != address(0));\r\n        return (exists, uploader);\r\n    }\r\n}"
+      }
+    }
+  }
+}
