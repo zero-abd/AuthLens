@@ -1,0 +1,3 @@
+[submodule "AuthLens-Frontend"]
+	path = AuthLens-Frontend
+	url = https://github.com/zero-abd/AuthLens-Frontend.git
