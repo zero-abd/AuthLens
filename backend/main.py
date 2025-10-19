@@ -2,11 +2,14 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pathlib import Path
 import shutil
 import tempfile
 import subprocess
+import asyncio
+import aiohttp
+import uuid
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Body, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -23,13 +26,11 @@ app = FastAPI(title="AuthLens Video Authentication API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # IMPORTANT: Configure this properly in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# IMPORTANT: Configure these environment variables before deployment
 
 SEPOLIA_RPC_URL = os.getenv("SEPOLIA_RPC_URL")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -101,6 +102,25 @@ class VerifyRequest(BaseModel):
 class VideoRangeRequest(BaseModel):
     start_datetime: str
     end_datetime: str
+
+
+class RemoteCameraConfig(BaseModel):
+    camera_name: str
+    ngrok_url: str
+
+
+class RemoteCameraResponse(BaseModel):
+    camera_id: str
+    camera_name: str
+    ngrok_url: str
+    status: str
+    created_at: str
+
+
+# In-memory storage for remote cameras
+remote_cameras: Dict[str, Dict] = {}
+# Background tasks for streaming
+streaming_tasks: Dict[str, asyncio.Task] = {}
 
 
 def hash_video_bytes(video_data: bytes) -> bytes:
@@ -351,7 +371,6 @@ async def retrieve_video_range(
                 filename=f"video_{format_timestamp_for_filename(start_dt)}_to_{format_timestamp_for_filename(end_dt)}.mp4"
             )
         
-        # IMPORTANT: Simple concatenation - consider using ffmpeg for production
         combined_data = io.BytesIO()
         for chunk in chunks:
             with open(chunk, "rb") as f:
@@ -514,6 +533,41 @@ def process_video_hash_in_background(filepath: Path, video_data: bytes):
         print(f"❌ Error in background processing for {filepath.name}: {e}")
 
 
+async def async_process_video_hash(filepath: Path, video_data: bytes, camera_id: str, start_time: datetime, end_time: datetime):
+    """Async version of hash processing for remote cameras"""
+    try:
+        print(f"\n🔄 Async processing started for: {filepath.name}")
+        
+        # Calculate hash
+        video_hash = hash_video_bytes(video_data)
+        hash_hex = f"0x{video_hash.hex()}"
+        
+        print(f"📊 Hash calculated: {hash_hex}")
+        
+        # Store on blockchain
+        blockchain_result = store_hash_on_chain(video_hash)
+        
+        # Save to ledger
+        ledger_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "camera_id": camera_id,
+            "chunk_filename": filepath.name,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "video_hash": hash_hex,
+            "transaction_hash": blockchain_result.get("transaction_hash", "already_exists"),
+            "block_number": blockchain_result.get("block_number"),
+            "status": "stored" if blockchain_result["success"] else "failed"
+        }
+        save_ledger_entry(ledger_entry)
+        
+        print(f"✅ Async processing completed for: {filepath.name}")
+        print(f"   Blockchain result: {blockchain_result['message']}")
+        
+    except Exception as e:
+        print(f"❌ Error in async processing for {filepath.name}: {e}")
+
+
 @app.get("/api/monitor/list-chunks")
 async def list_monitoring_chunks(
     camera_id: Optional[str] = Query(None, description="Filter by camera ID")
@@ -572,30 +626,19 @@ async def get_ledger(
     limit: Optional[int] = Query(100, description="Maximum number of entries to return"),
     camera_id: Optional[str] = Query(None, description="Filter by camera ID")
 ):
-    """
-    Get ledger entries of all chunks stored on blockchain
-    """
     try:
         print(f"📖 Fetching ledger entries (limit={limit}, camera_id={camera_id})")
         ledger = load_ledger()
         print(f"📊 Loaded {len(ledger)} total entries from ledger")
         
-        # Filter by camera_id if provided
         if camera_id:
             ledger = [entry for entry in ledger if entry.get("camera_id") == camera_id]
             print(f"🔍 Filtered to {len(ledger)} entries for camera_id={camera_id}")
         
-        # Sort by timestamp (newest first)
         ledger = sorted(ledger, key=lambda x: x.get("timestamp", ""), reverse=True)
-        
-        # Limit results
         ledger = ledger[:limit]
         
-        return {
-            "success": True,
-            "total_entries": len(ledger),
-            "entries": ledger
-        }
+        return {"success": True, "total_entries": len(ledger), "entries": ledger}
         
     except Exception as e:
         print(f"❌ Error fetching ledger: {e}")
@@ -692,7 +735,7 @@ async def download_video_range(
         chunk_files = [chunk[1] for chunk in matching_chunks]
         
         if len(chunk_files) == 1:
-            output_filename = f"{camera_id}_{formatTimeForFilename(start_dt)}_to_{formatTimeForFilename(end_dt)}.mp4"
+            output_filename = f"{camera_id}_{format_timestamp_for_filename(start_dt)}_to_{format_timestamp_for_filename(end_dt)}.mp4"
             return FileResponse(
                 chunk_files[0],
                 media_type="video/mp4",
@@ -709,7 +752,7 @@ async def download_video_range(
                     abs_path = chunk_file.absolute()
                     f.write(f"file '{abs_path}'\n")
             
-            output_filename = f"{camera_id}_{formatTimeForFilename(start_dt)}_to_{formatTimeForFilename(end_dt)}.mp4"
+            output_filename = f"{camera_id}_{format_timestamp_for_filename(start_dt)}_to_{format_timestamp_for_filename(end_dt)}.mp4"
             output_path = temp_dir / output_filename
             
             try:
@@ -742,10 +785,6 @@ async def download_video_range(
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 
-def formatTimeForFilename(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d_%H-%M-%S")
-
-
 def cleanup_temp_files(temp_files: list):
     for temp_file in temp_files:
         try:
@@ -759,31 +798,16 @@ def cleanup_temp_files(temp_files: list):
 
 
 @app.post("/api/validate/upload")
-async def validate_uploaded_video(
-    video: UploadFile = File(...)
-):
-    """
-    Validate an uploaded video by:
-    1. Splitting into 1-minute chunks
-    2. Hashing each chunk
-    3. Checking if hash exists in blockchain (recorded on facility cam)
-    4. Returning verification result
-    5. Cleaning up uploaded file
-    """
+async def validate_uploaded_video(video: UploadFile = File(...)):
     temp_video_path = None
     chunk_paths = []
     
     try:
-        # Save uploaded video temporarily
         temp_video_path = Path(tempfile.gettempdir()) / f"validate_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{video.filename}"
         video_data = await video.read()
         
         with open(temp_video_path, "wb") as f:
             f.write(video_data)
-        
-        # Get total file size for progress calculation
-        total_size = len(video_data)
-        estimated_chunks = max(1, int(total_size / (1024 * 1024 * 10)))
         
         results = []
         validated_count = 0
@@ -842,6 +866,337 @@ async def validate_uploaded_video(
                     chunk_path.unlink()
             except Exception as e:
                 print(f"Error deleting chunk file: {e}")
+
+
+@app.post("/api/remote-cameras/add")
+async def add_remote_camera(config: RemoteCameraConfig):
+    try:
+        camera_id = f"cam_remote_{str(uuid.uuid4())[:8]}"
+        camera_data = {
+            "camera_id": camera_id,
+            "camera_name": config.camera_name,
+            "ngrok_url": config.ngrok_url,
+            "status": "stopped",
+            "created_at": datetime.now().isoformat(),
+            "chunks_recorded": 0,
+            "is_monitoring": False
+        }
+        remote_cameras[camera_id] = camera_data
+        
+        return {"success": True, "message": "Remote camera added successfully", "camera": camera_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error adding remote camera: {str(e)}")
+
+
+@app.get("/api/remote-cameras/list")
+async def list_remote_cameras():
+    return {"success": True, "cameras": list(remote_cameras.values()), "total": len(remote_cameras)}
+
+
+@app.delete("/api/remote-cameras/{camera_id}")
+async def remove_remote_camera(camera_id: str):
+    try:
+        if camera_id not in remote_cameras:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        # Stop monitoring first
+        if camera_id in streaming_tasks:
+            streaming_tasks[camera_id].cancel()
+            try:
+                await streaming_tasks[camera_id]
+            except asyncio.CancelledError:
+                pass
+            del streaming_tasks[camera_id]
+        
+        camera_data = remote_cameras[camera_id]
+        del remote_cameras[camera_id]
+        
+        return {"success": True, "message": f"Camera {camera_data['camera_name']} removed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error removing camera: {str(e)}")
+
+
+@app.post("/api/remote-cameras/{camera_id}/start")
+async def start_remote_camera_monitoring(camera_id: str):
+    """Start monitoring a remote camera"""
+    try:
+        if camera_id not in remote_cameras:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        if camera_id in streaming_tasks:
+            return {"success": False, "message": "Camera is already monitoring"}
+        
+        camera = remote_cameras[camera_id]
+        camera["status"] = "active"
+        camera["is_monitoring"] = True
+        camera["chunks_recorded"] = 0
+        
+        # Start the streaming and recording task
+        task = asyncio.create_task(stream_and_record_remote_camera(
+            camera_id, 
+            camera["ngrok_url"],
+            camera["camera_name"]
+        ))
+        streaming_tasks[camera_id] = task
+        
+        return {
+            "success": True, 
+            "message": f"Started monitoring {camera['camera_name']}", 
+            "camera": camera
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting camera: {str(e)}")
+
+
+@app.post("/api/remote-cameras/{camera_id}/stop")
+async def stop_remote_camera_monitoring(camera_id: str):
+    """Stop monitoring a remote camera"""
+    try:
+        if camera_id not in remote_cameras:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        if camera_id in streaming_tasks:
+            streaming_tasks[camera_id].cancel()
+            try:
+                await streaming_tasks[camera_id]
+            except asyncio.CancelledError:
+                pass
+            del streaming_tasks[camera_id]
+        
+        camera = remote_cameras[camera_id]
+        camera["status"] = "stopped"
+        camera["is_monitoring"] = False
+        
+        return {
+            "success": True, 
+            "message": f"Stopped monitoring {camera['camera_name']}", 
+            "camera": camera
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error stopping camera: {str(e)}")
+
+
+@app.get("/api/remote-cameras/{camera_id}/test-stream")
+async def test_remote_camera_stream(camera_id: str):
+    """Test endpoint to check what the remote camera is sending"""
+    try:
+        if camera_id not in remote_cameras:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        ngrok_url = remote_cameras[camera_id]["ngrok_url"]
+        
+        async with aiohttp.ClientSession() as session:
+            # Try HEAD request first
+            try:
+                async with session.head(ngrok_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    headers = dict(response.headers)
+                    status = response.status
+                    head_result = {
+                        "method": "HEAD",
+                        "status": status,
+                        "headers": headers,
+                        "content_type": headers.get('Content-Type', 'unknown')
+                    }
+            except Exception as e:
+                head_result = {"method": "HEAD", "error": str(e)}
+            
+            # Try GET request and read first chunk
+            try:
+                async with session.get(ngrok_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    headers = dict(response.headers)
+                    status = response.status
+                    
+                    # Read first 1KB
+                    first_chunk = await response.content.read(1024)
+                    
+                    get_result = {
+                        "method": "GET",
+                        "status": status,
+                        "headers": headers,
+                        "content_type": headers.get('Content-Type', 'unknown'),
+                        "first_bytes_hex": first_chunk[:20].hex(),
+                        "first_bytes_size": len(first_chunk)
+                    }
+            except Exception as e:
+                get_result = {"method": "GET", "error": str(e)}
+        
+        return {
+            "camera_id": camera_id,
+            "ngrok_url": ngrok_url,
+            "head_request": head_result,
+            "get_request": get_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error testing stream: {str(e)}")
+
+
+@app.get("/api/remote-cameras/{camera_id}/stream")
+async def get_remote_camera_stream(camera_id: str):
+    """Stream video from remote camera - supports MJPEG and MP4 formats"""
+    try:
+        if camera_id not in remote_cameras:
+            print(f"⚠️ Camera {camera_id} not found. Available cameras: {list(remote_cameras.keys())}")
+            raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+        
+        ngrok_url = remote_cameras[camera_id]["ngrok_url"]
+        print(f"🎬 Starting stream proxy for {camera_id} from {ngrok_url}")
+        
+        async def generate_video_stream():
+            """Generate video stream by proxying from the remote camera"""
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(
+                        ngrok_url,
+                        timeout=aiohttp.ClientTimeout(total=None)
+                    ) as response:
+                        print(f"✅ Connected to stream source for {camera_id}")
+                        # Get content type from actual response
+                        content_type = response.headers.get('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                        print(f"📺 Stream content-type: {content_type}")
+                        
+                        chunk_count = 0
+                        async for chunk in response.content.iter_chunked(8192):
+                            if camera_id not in remote_cameras:
+                                print(f"🛑 Camera {camera_id} removed, stopping stream")
+                                break
+                            chunk_count += 1
+                            if chunk_count % 100 == 0:  # Log every 100 chunks (~800KB)
+                                print(f"📊 Streamed {chunk_count} chunks to {camera_id}")
+                            yield chunk
+                except asyncio.CancelledError:
+                    # This is normal when the client disconnects
+                    pass
+                except Exception as e:
+                    print(f"❌ Error streaming from {camera_id}: {e}")
+        
+        return StreamingResponse(
+            generate_video_stream(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Accept-Ranges": "none"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Stream error for {camera_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error streaming camera: {str(e)}")
+
+
+async def stream_and_record_remote_camera(camera_id: str, ngrok_url: str, camera_name: str):
+    print(f"🎥 Starting stream recording for {camera_id} ({camera_name}) from {ngrok_url}")
+    
+    # Background task to continuously accumulate frames
+    frame_buffer = []
+    buffer_lock = asyncio.Lock()
+    
+    async def accumulate_frames():
+        """Continuously download and accumulate frames from the stream"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ngrok_url, timeout=aiohttp.ClientTimeout(total=None)) as response:
+                    print(f"📡 Connected to stream for {camera_id} ({camera_name})")
+                    async for chunk in response.content.iter_chunked(1024 * 64):  # 64KB chunks
+                        if camera_id not in remote_cameras or not remote_cameras[camera_id].get("is_monitoring", False):
+                            break
+                        async with buffer_lock:
+                            frame_buffer.append(chunk)
+        except asyncio.CancelledError:
+            print(f"🛑 Frame accumulation cancelled for {camera_id} ({camera_name})")
+        except Exception as e:
+            print(f"❌ Error accumulating frames for {camera_id} ({camera_name}): {e}")
+    
+    # Start frame accumulation in background
+    accumulator_task = asyncio.create_task(accumulate_frames())
+    
+    try:
+        # Wait until the next minute mark to start synchronized recording
+        now = datetime.now()
+        next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        initial_wait = (next_minute - now).total_seconds()
+        print(f"⏱️ Waiting {initial_wait:.1f}s until {next_minute.strftime('%H:%M:%S')} to start synchronized recording for {camera_id} ({camera_name})")
+        await asyncio.sleep(initial_wait)
+        
+        while camera_id in remote_cameras and remote_cameras[camera_id].get("is_monitoring", False):
+            try:
+                start_time = datetime.now().replace(second=0, microsecond=0)
+                end_time = start_time + timedelta(minutes=1)
+                print(f"📹 Recording chunk for {camera_id} ({camera_name}): {start_time.strftime('%H:%M:%S')} to {end_time.strftime('%H:%M:%S')}")
+                
+                # Clear buffer and start fresh for this minute
+                async with buffer_lock:
+                    frame_buffer.clear()
+                
+                # Wait for 60 seconds to accumulate frames
+                await asyncio.sleep(60)
+                
+                # Get accumulated frames
+                async with buffer_lock:
+                    chunk_data = b''.join(frame_buffer)
+                    frame_count = len(frame_buffer)
+                
+                if chunk_data and len(chunk_data) > 0:
+                    start_str = format_timestamp_for_filename(start_time)
+                    end_str = format_timestamp_for_filename(end_time)
+                    # Use camera_name instead of camera_id for filename
+                    safe_camera_name = camera_name.replace(" ", "_").replace("/", "_")
+                    filename = f"{safe_camera_name}_{start_str}-{end_str}.mp4"
+                    filepath = DB_DIR / filename
+                    
+                    with open(filepath, "wb") as f:
+                        f.write(chunk_data)
+                    
+                    # Process hash in background
+                    asyncio.create_task(async_process_video_hash(filepath, chunk_data, camera_name, start_time, end_time))
+                    
+                    remote_cameras[camera_id]["chunks_recorded"] += 1
+                    remote_cameras[camera_id]["last_chunk"] = datetime.now().isoformat()
+                    print(f"✅ Chunk saved: {filename} ({len(chunk_data)} bytes, {frame_count} frames)")
+                else:
+                    print(f"⚠️ No data received for {camera_id} ({camera_name}) in this minute")
+                    
+            except asyncio.CancelledError:
+                print(f"🛑 Recording loop cancelled for {camera_id} ({camera_name})")
+                break
+            except Exception as e:
+                print(f"❌ Error in recording loop for {camera_id} ({camera_name}): {e}")
+                await asyncio.sleep(5)
+    finally:
+        accumulator_task.cancel()
+        try:
+            await accumulator_task
+        except asyncio.CancelledError:
+            pass
+        if camera_id in remote_cameras:
+            remote_cameras[camera_id]["status"] = "stopped"
+            remote_cameras[camera_id]["is_monitoring"] = False
+
+
+async def download_video_chunk(url: str, duration: int = 60) -> bytes:
+    try:
+        async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=duration + 10)
+            async with session.get(url, timeout=timeout) as response:
+                chunks = []
+                start_time = asyncio.get_event_loop().time()
+                async for chunk in response.content.iter_chunked(1024 * 64):
+                    chunks.append(chunk)
+                    if asyncio.get_event_loop().time() - start_time >= duration:
+                        break
+                return b''.join(chunks)
+    except Exception as e:
+        print(f"Error downloading chunk: {e}")
+        return b''
 
 
 if __name__ == "__main__":
