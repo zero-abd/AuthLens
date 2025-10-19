@@ -9,3 +9,8 @@ node_modules
 /types
 /coverage
 test_videos/*.mp4
+video_chunks/
+*.mp4
+*.avi
+*.mov
+*.mkv
