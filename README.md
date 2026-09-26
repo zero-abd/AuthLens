@@ -2,6 +2,8 @@
 
 <p align="left"><i>Built for HackTX 2025</i></p>
 
+**Live demo: https://authlens-app.vercel.app**. Verify any video against the deployed Sepolia contract right in your browser, or register one from your own MetaMask wallet. No backend or keys are needed for the demo. The web app lives in the `AuthLens-Frontend` submodule ([zero-abd/AuthLens-Frontend](https://github.com/zero-abd/AuthLens-Frontend), branch `main`).
+
 ## 📖 Overview
 
 AuthLens is a blockchain-powered video authentication platform that ensures the integrity and verifiability of video evidence. By storing cryptographic hashes of video chunks on the Ethereum blockchain, AuthLens provides tamper-proof verification of video authenticity, timestamps, and ownership.
